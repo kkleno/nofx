@@ -123,24 +123,44 @@ func syncBinanceServerTime(client *futures.Client) {
 	logger.Infof("⏱ Binance server time synced, offset %dms", offset)
 }
 
-// GetBalance gets account balance (with cache)
+// GetBalance gets account balance (with cache) - 优化版：60秒缓存 + 减少不必要日志
 func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
-	// First check if cache is valid
+	// First check if cache is valid (延长到60秒，减少75%请求)
 	t.balanceCacheMutex.RLock()
-	if t.cachedBalance != nil && time.Since(t.balanceCacheTime) < t.cacheDuration {
+	if t.cachedBalance != nil && time.Since(t.balanceCacheTime) < 60*time.Second {
 		cacheAge := time.Since(t.balanceCacheTime)
 		t.balanceCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached account balance (cache age: %.1f seconds ago)", cacheAge.Seconds())
+		// 只在调试时打印，避免刷屏
+		if cacheAge.Seconds() > 50 {
+			logger.Infof("Using cached account balance (age: %.1fs)", cacheAge.Seconds())
+		}
 		return t.cachedBalance, nil
 	}
 	t.balanceCacheMutex.RUnlock()
 
-	// Cache expired or doesn't exist, call API
-	logger.Infof("🔄 Cache expired, calling Binance API to get account balance...")
+	// 缓存过期才调用API
+	logger.Infof("Cache expired, refreshing account balance via API...")
 	account, err := t.client.NewGetAccountService().Do(context.Background())
 	if err != nil {
-		logger.Infof("❌ Binance API call failed: %v", err)
+		logger.Infof("Binance API call failed: %v", err)
 		return nil, fmt.Errorf("failed to get account info: %w", err)
+	}
+
+	result := make(map[string]interface{})
+	result["totalWalletBalance"], _ = strconv.ParseFloat(account.TotalWalletBalance, 64)
+	result["availableBalance"], _ = strconv.ParseFloat(account.AvailableBalance, 64)
+	result["totalUnrealizedProfit"], _ = strconv.ParseFloat(account.TotalUnrealizedProfit, 64)
+
+	logger.Infof("Balance refreshed: total=%.2f, available=%.2f, PnL=%.2f",
+		result["totalWalletBalance"], result["availableBalance"], result["totalUnrealizedProfit"])
+
+	// Update cache
+	t.balanceCacheMutex.Lock()
+	t.cachedBalance = result
+	t.balanceCacheTime = time.Now()
+	t.balanceCacheMutex.Unlock()
+
+	return result, nil
 	}
 
 	result := make(map[string]interface{})
